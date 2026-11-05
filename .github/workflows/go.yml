@@ -1,0 +1,295 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Build
+        run: |
+          go mod tidy
+          BUILD_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+          GIT_BRANCH="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")}"
+          go build -v -ldflags="-X 'github.com/esrrhs/pingtunnel.BuildTime=${BUILD_TIME}' -X 'github.com/esrrhs/pingtunnel.GitCommit=${GIT_COMMIT}' -X 'github.com/esrrhs/pingtunnel.GitBranch=${GIT_BRANCH}'" ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+      - name: Test
+        run: go test -v -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.txt
+          fail_ci_if_error: true
+
+      - name: Benchmark smoke (single iteration each)
+        # Keeps the benchmarks compilable and runnable; real regression
+        # tracking happens locally with benchstat, not on shared CI runners.
+        run: go test -run '^$' -bench . -benchtime=1x .
+
+  # The race detector over the full suite (fake-underlay e2e included) — the
+  # tunnel machinery is goroutine-heavy (conn pools, backpressure, heartbeat
+  # timers) and the unit tests alone rarely interleave enough to expose
+  # races. Same conditions as the build job's e2e: no root, no raw ICMP.
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Test with race detector (full suite)
+        run: go test -race -timeout 35m ./...
+
+  # Platform smoke: build, vet and the unit tests (e2e excluded — the fake
+  # underlay is tuned for Linux/macOS port budgets, and real-ICMP coverage
+  # already has a dedicated Linux job). Catches platform-specific breakage
+  # in portable code paths, including Windows where the runner's admin user
+  # takes the privileged branch of the raw-ICMP tests.
+  smoke-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests (e2e excluded)
+        run: go test -timeout 15m -skip '^TestE2E' ./...
+
+  # Short fuzzing windows on the network-facing parsers. These only catch
+  # cheap-to-reach crashes; deeper sessions are meant to be run locally, and
+  # any finding lands in testdata/fuzz/ as a regression seed for the normal
+  # unit suite.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Fuzz SOCKS5 request parser (30s)
+        run: go test . -run '^$' -fuzz FuzzReadSocks5Request -fuzztime 30s
+
+      - name: Fuzz SOCKS5 UDP datagram parser (30s)
+        run: go test . -run '^$' -fuzz FuzzParseSocks5UDPDatagram -fuzztime 30s
+
+      - name: Fuzz tunnel message decoding (30s)
+        run: go test . -run '^$' -fuzz FuzzMyMsgUnmarshal -fuzztime 30s
+
+      - name: Fuzz crypto decrypt (30s)
+        run: go test . -run '^$' -fuzz FuzzCryptoDecrypt -fuzztime 30s
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-corpus
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
+  # The build job above runs the e2e suite unprivileged (in-process fake
+  # underlay). This job runs the same suite over real raw ICMP sockets as
+  # root, covering the kernel path the fake cannot: raw-socket behavior and
+  # the kernel's automatic echo replies. REQUIRE_REAL_ICMP makes the suite
+  # fail loudly instead of silently falling back to the fake.
+  e2e-icmp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Build e2e binary
+        run: go test -c -o /tmp/pingtunnel-e2e.test .
+
+      - name: Run e2e suite over real ICMP (root)
+        run: |
+          set -o pipefail
+          sudo env PINGTUNNEL_E2E_REQUIRE_REAL_ICMP=1 PINGTUNNEL_E2E_LOGLEVEL=info /tmp/pingtunnel-e2e.test -test.run TestE2E -test.v -test.timeout 20m 2>&1 | tee /tmp/e2e-icmp.log
+      - name: Report failures
+        if: failure() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "e2e-icmp failures (attempt ${{ github.run_attempt }}):"
+            grep -aE "^(--- |    --- )?FAIL:|died at|died during|sha256 mismatch|Error read tcp|Error write tcp" /tmp/e2e-icmp.log | tail -30
+          } | gh pr comment ${{ github.event.pull_request.number }} --body-file -
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version change
+        id: check_version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          CURRENT_VERSION=$(sed -n 's/.*const Version = "\(.*\)".*/\1/p' version.go || true)
+          echo "Current version in version.go: ${CURRENT_VERSION}"
+
+          if [ -z "${CURRENT_VERSION}" ]; then
+            echo "No version found in version.go, skipping release."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          PREV_VERSION=""
+          if [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            if git cat-file -e "${BEFORE_SHA}:version.go" 2>/dev/null; then
+              PREV_VERSION=$(git show "${BEFORE_SHA}:version.go" | sed -n 's/.*const Version = "\(.*\)".*/\1/p' || true)
+            fi
+          fi
+          echo "Previous version: ${PREV_VERSION}"
+
+          # Check if tag already exists in repository
+          if git rev-parse "refs/tags/${CURRENT_VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${CURRENT_VERSION} already exists, skipping release to prevent duplicate."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Tag for version '${CURRENT_VERSION}' does not exist. Triggering release!"
+          echo "should_release=true" >> "${GITHUB_OUTPUT}"
+          echo "version=${CURRENT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.3"
+
+      - name: Set up Android SDK
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK
+        if: steps.check_version.outputs.should_release == 'true'
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "${ANDROID_NDK_HOME}" ]; then
+            echo "Using preinstalled Android NDK at ${ANDROID_NDK_HOME}"
+          elif [ -d "/usr/local/lib/android/sdk/ndk" ] && [ -n "$(ls -A /usr/local/lib/android/sdk/ndk 2>/dev/null)" ]; then
+            NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/* | tail -1)
+            echo "Found preinstalled Android NDK at ${NDK_DIR}"
+            echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "${GITHUB_ENV}"
+          else
+            # Temporarily disable pipefail so the pipeline status reflects sdkmanager.
+            set +o pipefail
+            yes | sdkmanager --licenses >/dev/null || true
+            set -o pipefail
+            sdkmanager --install "ndk;27.1.12297006"
+            echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.1.12297006" >> "${GITHUB_ENV}"
+          fi
+          echo "ANDROID_API_LEVEL=21" >> "${GITHUB_ENV}"
+
+      - name: Build release artifacts
+        if: steps.check_version.outputs.should_release == 'true'
+        run: ./pack.sh
+
+      - name: Prepare release metadata
+        if: steps.check_version.outputs.should_release == 'true'
+        id: release_meta
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          VERSION: ${{ steps.check_version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${VERSION}"
+          RELEASE_NAME="${VERSION}"
+
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "${LAST_TAG}" ] && git cat-file -e "${LAST_TAG}^{commit}" 2>/dev/null; then
+            COMMIT_LINES="$(git log --pretty='- %h %s' "${LAST_TAG}..${AFTER_SHA}")"
+          elif [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            COMMIT_LINES="$(git log --pretty='- %h %s' "${BEFORE_SHA}..${AFTER_SHA}")"
+          else
+            COMMIT_LINES="$(git log -n 10 --pretty='- %h %s' "${AFTER_SHA}")"
+          fi
+
+          if [ -z "${COMMIT_LINES}" ]; then
+            COMMIT_LINES="- ${AFTER_SHA:0:7} release version ${VERSION}"
+          fi
+
+          {
+            echo "tag_name=${TAG_NAME}"
+            echo "release_name=${RELEASE_NAME}"
+            echo "body<<EOF"
+            echo "Release ${VERSION} (${AFTER_SHA:0:7})"
+            echo ""
+            echo "## Commits"
+            echo "${COMMIT_LINES}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Create release and upload artifacts
+        if: steps.check_version.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_name }}
+          body: ${{ steps.release_meta.outputs.body }}
+          files: |
+            cmd/pack.zip
+            cmd/pack/*.zip
+          fail_on_unmatched_files: true
